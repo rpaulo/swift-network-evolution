@@ -456,6 +456,11 @@ extension CongestionControl {
     }
 }
 
+// Congestion window validation samples (RFC 7661 pipeACK), stored inline to avoid a heap
+// allocation per controller.
+@available(Network 0.1.0, *)
+typealias PipeAckSamples = [3 of UInt64]
+
 @available(Network 0.1.0, *)
 protocol CongestionControlProtocol: PrefixedLoggable {
     var congestionWindow: UInt64 { get set }
@@ -468,7 +473,7 @@ protocol CongestionControlProtocol: PrefixedLoggable {
     var prevSlowStartThreshold: UInt64 { get set }
     var recoveryStartTime: NetworkClock.Instant { get set }
     var bytesAcked: UInt64 { get set }
-    var pipeAckSamples: [UInt64] { get set }
+    var pipeAckSamples: PipeAckSamples { get set }
     var pipeAckValue: UInt64 { get set }
     var pipeAckSampleEnd: NetworkClock.Instant { get set }
     var pipeAckAcked: UInt64 { get set }
@@ -530,7 +535,7 @@ protocol CongestionControlProtocol: PrefixedLoggable {
 @available(Network 0.1.0, *)
 extension CongestionControlProtocol {
     var congestionWindowValidationSamples: Int {
-        3
+        PipeAckSamples.count
     }
 
     var availableCongestionWindow: UInt64 {
@@ -668,7 +673,7 @@ extension CongestionControlProtocol {
     }
 
     mutating func initPipeAckSamples() {
-        pipeAckSamples = Array(repeating: 0, count: congestionWindowValidationSamples)
+        pipeAckSamples = PipeAckSamples(repeating: 0)
         pipeAckIndex = 0
         pipeAckValue = 0
     }

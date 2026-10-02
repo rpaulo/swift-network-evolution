@@ -64,7 +64,7 @@ struct Cubic: CongestionControlProtocol, CubicLikeProtocol {
     var prevSlowStartThreshold = UInt64.max
     var recoveryStartTime = NetworkClock.Instant.zero
     var bytesAcked = UInt64(0)
-    var pipeAckSamples = [UInt64(0)]
+    var pipeAckSamples = PipeAckSamples(repeating: 0)
     var pipeAckValue = UInt64(0)
     var pipeAckSampleEnd = NetworkClock.Instant.zero
     var pipeAckAcked = UInt64(0)
