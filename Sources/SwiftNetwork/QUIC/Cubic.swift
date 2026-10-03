@@ -110,10 +110,6 @@ struct Cubic: CongestionControlProtocol, CubicLikeProtocol {
         logState(qlog: qlog, state: .slowStart, trigger: nil)
     }
 
-    init(placeholder logPrefixer: LogPrefixer) {
-        self.log = logPrefixer
-    }
-
     private mutating func setK(mss: Int) {
         // K is the time period(s) that WCubic(t) function takes to increase
         // the current window size to WMax if there are no further

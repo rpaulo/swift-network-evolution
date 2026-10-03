@@ -140,10 +140,6 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         logState(qlog: qlog, state: .slowStart, trigger: nil)
     }
 
-    init(placeholder logPrefixer: LogPrefixer) {
-        self.log = logPrefixer
-    }
-
     /// Computes the cubic K factor for the current congestion window.
     ///
     /// `K` is the time period(s) that the `W_cubic(t)` function takes to increase

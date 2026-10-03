@@ -156,7 +156,7 @@ public final class QUICPath: MultiplexingDatagramPath<
 
     var bdp = BandwidthDelayProduct()
 
-    private var congestionControl = CongestionControl()
+    private var congestionControl: CongestionControl = .uninitialized
 
     var pacer: Pacer
 

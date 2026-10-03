@@ -28,18 +28,27 @@ internal import os
 @available(Network 0.1.0, *)
 protocol CongestionControlOperation: ~Copyable {
     associatedtype Result
+    // Returned when there is no controller yet.
+    static var resultWhenUninitialized: Result { get }
     func callAsFunction<Controller: CongestionControlProtocol>(_ controller: inout Controller) -> Result
+}
+
+@available(Network 0.1.0, *)
+extension CongestionControlOperation where Self: ~Copyable, Result == Void {
+    static var resultWhenUninitialized: Void { () }
 }
 
 // A read of whichever congestion controller is active.
 @available(Network 0.1.0, *)
 protocol CongestionControlQuery: ~Copyable {
     associatedtype Result
+    // Returned when there is no controller yet.
+    static var resultWhenUninitialized: Result { get }
     func callAsFunction<Controller: CongestionControlProtocol>(_ controller: Controller) -> Result
 }
 
 @available(Network 0.1.0, *)
-struct CongestionControl: ~Copyable {
+enum CongestionControl: ~Copyable {
     enum Algorithm: UInt8 {
         case cubic
         #if !NETWORK_EMBEDDED
@@ -58,24 +67,13 @@ struct CongestionControl: ~Copyable {
         }
     }
 
-    private(set) var algorithm: Algorithm
-    private var cubic: Cubic
+    // No controller yet (before `QUICPath.setup()`): operations do nothing and reads return zero.
+    case uninitialized
+    case cubic(Cubic)
     #if !NETWORK_EMBEDDED
-    private var ledbat: Ledbat
-    private var prague: Prague
+    case ledbat(Ledbat)
+    case prague(Prague)
     #endif
-
-    // Placeholder initializer to allow non-Optional types.
-    // CongestionControl is supposed to be initialized later.
-    init() {
-        let logPrefixer = LogPrefixer()
-        self.algorithm = .cubic
-        self.cubic = Cubic(placeholder: logPrefixer)
-        #if !NETWORK_EMBEDDED
-        self.ledbat = Ledbat(placeholder: logPrefixer)
-        self.prague = Prague(placeholder: logPrefixer)
-        #endif
-    }
 
     init(
         algorithm: Algorithm,
@@ -84,39 +82,47 @@ struct CongestionControl: ~Copyable {
         qlog: QLog? = nil,
         logPrefixer: LogPrefixer
     ) {
-        self.algorithm = algorithm
-        self.cubic = Cubic(placeholder: logPrefixer)
+        self = Self.make(algorithm, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
+    }
+
+    private static func make(
+        _ algorithm: Algorithm,
+        pacer: inout Pacer,
+        mss: Int,
+        qlog: QLog?,
+        logPrefixer: LogPrefixer
+    ) -> CongestionControl {
+        switch algorithm {
+        case .cubic:
+            return .cubic(Cubic(pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer))
         #if !NETWORK_EMBEDDED
-        self.ledbat = Ledbat(placeholder: logPrefixer)
-        self.prague = Prague(placeholder: logPrefixer)
+        case .ledbat:
+            return .ledbat(Ledbat(mss: mss, qlog: qlog, logPrefixer: logPrefixer))
+        case .prague:
+            return .prague(Prague(pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer))
         #endif
-        // Reset and properly initialize the algorithm.
-        reset(pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
+        }
+    }
+
+    // The active algorithm, or `nil` before a controller has been created.
+    var algorithm: Algorithm? {
+        switch self {
+        case .uninitialized: return nil
+        case .cubic: return .cubic
+        #if !NETWORK_EMBEDDED
+        case .ledbat: return .ledbat
+        case .prague: return .prague
+        #endif
+        }
     }
 
     // Re-creates the active controller from scratch.
     mutating func reset(pacer: inout Pacer, mss: Int, qlog: QLog?, logPrefixer: LogPrefixer) {
-        switch algorithm {
-        case .cubic:
-            cubic = Cubic(pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-        #if !NETWORK_EMBEDDED
-        case .ledbat:
-            ledbat = Ledbat(mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-        case .prague:
-            prague = Prague(pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-        #endif
-        }
+        guard let algorithm else { return }
+        self = Self.make(algorithm, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
     }
 
     #if !NETWORK_EMBEDDED
-    private func handOff<Next: CongestionControlProtocol>(to next: inout Next, mss: Int, qlog: QLog?) {
-        switch algorithm {
-        case .cubic: next.inherit(from: cubic, mss: mss, qlog: qlog)
-        case .ledbat: next.inherit(from: ledbat, mss: mss, qlog: qlog)
-        case .prague: next.inherit(from: prague, mss: mss, qlog: qlog)
-        }
-    }
-
     // Switches to another algorithm, handing it the outgoing controller's state.
     mutating func switchTo(
         _ newAlgorithm: Algorithm,
@@ -125,35 +131,41 @@ struct CongestionControl: ~Copyable {
         qlog: QLog?,
         logPrefixer: LogPrefixer
     ) {
-        guard newAlgorithm != algorithm else { return }
-        switch newAlgorithm {
-        case .cubic:
-            var next = Cubic(pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-            handOff(to: &next, mss: mss, qlog: qlog)
-            cubic = next
-        case .ledbat:
-            var next = Ledbat(mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-            handOff(to: &next, mss: mss, qlog: qlog)
-            ledbat = next
-        case .prague:
-            var next = Prague(pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-            handOff(to: &next, mss: mss, qlog: qlog)
-            prague = next
+        guard let algorithm, algorithm != newAlgorithm else { return }
+        var next = Self.make(newAlgorithm, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
+        switch self {
+        case .uninitialized: break
+        case .cubic(let previous): next.perform(Op.Inherit(previous: previous, mss: mss, qlog: qlog))
+        case .ledbat(let previous): next.perform(Op.Inherit(previous: previous, mss: mss, qlog: qlog))
+        case .prague(let previous): next.perform(Op.Inherit(previous: previous, mss: mss, qlog: qlog))
         }
-        algorithm = newAlgorithm
+        self = next
     }
     #endif
 
-    // Dispatches a mutating operation on the algorithm.
+    // Dispatches a mutating operation on the algorithm. Consuming `self` moves the controller
+    // out, so it is uniquely owned while it is mutated and then moved back.
     @inline(always)
     private mutating func perform<Operation: CongestionControlOperation & ~Copyable>(
         _ operation: borrowing Operation
     ) -> Operation.Result {
-        switch algorithm {
-        case .cubic: return operation(&cubic)
+        switch consume self {
+        case .uninitialized:
+            self = .uninitialized
+            return Operation.resultWhenUninitialized
+        case .cubic(var controller):
+            let result = operation(&controller)
+            self = .cubic(controller)
+            return result
         #if !NETWORK_EMBEDDED
-        case .ledbat: return operation(&ledbat)
-        case .prague: return operation(&prague)
+        case .ledbat(var controller):
+            let result = operation(&controller)
+            self = .ledbat(controller)
+            return result
+        case .prague(var controller):
+            let result = operation(&controller)
+            self = .prague(controller)
+            return result
         #endif
         }
     }
@@ -163,16 +175,17 @@ struct CongestionControl: ~Copyable {
     private func inspect<Query: CongestionControlQuery & ~Copyable>(
         _ query: borrowing Query
     ) -> Query.Result {
-        switch algorithm {
-        case .cubic: return query(cubic)
+        switch self {
+        case .uninitialized: return Query.resultWhenUninitialized
+        case .cubic(let controller): return query(controller)
         #if !NETWORK_EMBEDDED
-        case .ledbat: return query(ledbat)
-        case .prague: return query(prague)
+        case .ledbat(let controller): return query(controller)
+        case .prague(let controller): return query(controller)
         #endif
         }
     }
 
-    var name: String { algorithm.name }
+    var name: String { algorithm?.name ?? "none" }
 
     var congestionWindow: UInt64 { inspect(Read.CongestionWindow()) }
     var availableCongestionWindow: UInt64 { inspect(Read.AvailableCongestionWindow()) }
@@ -181,14 +194,16 @@ struct CongestionControl: ~Copyable {
 
     // `inout` arguments can't be stored in a query, so this one dispatches by hand.
     func filloutDataTransferSnapshot(dataTransferSnapshot: inout DataTransferSnapshot) {
-        switch algorithm {
-        case .cubic:
-            cubic.filloutDataTransferSnapshot(dataTransferSnapshot: &dataTransferSnapshot)
+        switch self {
+        case .uninitialized:
+            break
+        case .cubic(let controller):
+            controller.filloutDataTransferSnapshot(dataTransferSnapshot: &dataTransferSnapshot)
         #if !NETWORK_EMBEDDED
-        case .ledbat:
-            ledbat.filloutDataTransferSnapshot(dataTransferSnapshot: &dataTransferSnapshot)
-        case .prague:
-            prague.filloutDataTransferSnapshot(dataTransferSnapshot: &dataTransferSnapshot)
+        case .ledbat(let controller):
+            controller.filloutDataTransferSnapshot(dataTransferSnapshot: &dataTransferSnapshot)
+        case .prague(let controller):
+            controller.filloutDataTransferSnapshot(dataTransferSnapshot: &dataTransferSnapshot)
         #endif
         }
     }
@@ -208,14 +223,19 @@ struct CongestionControl: ~Copyable {
         now: NetworkClock.Instant,
         qlog: QLog? = nil
     ) {
-        switch algorithm {
-        case .cubic:
-            cubic.ackEnd(rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
+        switch consume self {
+        case .uninitialized:
+            self = .uninitialized
+        case .cubic(var controller):
+            controller.ackEnd(rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
+            self = .cubic(controller)
         #if !NETWORK_EMBEDDED
-        case .ledbat:
-            ledbat.ackEnd(rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
-        case .prague:
-            prague.ackEnd(rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
+        case .ledbat(var controller):
+            controller.ackEnd(rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
+            self = .ledbat(controller)
+        case .prague(var controller):
+            controller.ackEnd(rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
+            self = .prague(controller)
         #endif
         }
     }
@@ -312,24 +332,32 @@ struct CongestionControl: ~Copyable {
 extension CongestionControl {
     fileprivate enum Read {
         struct CongestionWindow: CongestionControlQuery, ~Copyable {
+            static var resultWhenUninitialized: UInt64 { 0 }
+
             func callAsFunction<Controller: CongestionControlProtocol>(_ controller: Controller) -> UInt64 {
                 controller.congestionWindow
             }
         }
 
         struct AvailableCongestionWindow: CongestionControlQuery, ~Copyable {
+            static var resultWhenUninitialized: UInt64 { 0 }
+
             func callAsFunction<Controller: CongestionControlProtocol>(_ controller: Controller) -> UInt64 {
                 controller.availableCongestionWindow
             }
         }
 
         struct BytesInFlight: CongestionControlQuery, ~Copyable {
+            static var resultWhenUninitialized: UInt64 { 0 }
+
             func callAsFunction<Controller: CongestionControlProtocol>(_ controller: Controller) -> UInt64 {
                 controller.bytesInFlight
             }
         }
 
         struct CanSend: CongestionControlQuery, ~Copyable {
+            static var resultWhenUninitialized: Bool { false }
+
             let packetLength: Int
 
             func callAsFunction<Controller: CongestionControlProtocol>(_ controller: Controller) -> Bool {
@@ -339,6 +367,18 @@ extension CongestionControl {
     }
 
     fileprivate enum Op {
+        #if !NETWORK_EMBEDDED
+        struct Inherit<Previous: CongestionControlProtocol>: CongestionControlOperation, ~Copyable {
+            let previous: Previous
+            let mss: Int
+            let qlog: QLog?
+
+            func callAsFunction<Controller: CongestionControlProtocol>(_ controller: inout Controller) {
+                controller.inherit(from: previous, mss: mss, qlog: qlog)
+            }
+        }
+        #endif
+
         struct PersistentCongestion: CongestionControlOperation, ~Copyable {
             let mss: Int
             let qlog: QLog?
@@ -367,6 +407,8 @@ extension CongestionControl {
         }
 
         struct PacketsLost: CongestionControlOperation, ~Copyable {
+            static var resultWhenUninitialized: Bool { false }
+
             let path: QUICPath?
             let bytesLost: Int
             let largestLostSentTime: NetworkClock.Instant

@@ -66,10 +66,6 @@ struct Ledbat: CongestionControlProtocol, CubicLikeProtocol {
         logUpdate(qlog: qlog)
     }
 
-    init(placeholder logPrefixer: LogPrefixer) {
-        self.log = logPrefixer
-    }
-
     // GAIN is proportional to the ratio of base_delay
     // and TARGET delay, i.e., GAIN is smaller for bottlenecks
     // with small queues in order to ensure that LEDBAT yields
