@@ -243,81 +243,125 @@ struct CongestionControlState {
     }
 }
 
-/// Owns the shared congestion control state plus the active algorithm
+// An operation on whichever congestion controller is active, with the shared state.
+@available(Network 0.1.0, *)
+protocol CongestionControlOperation: ~Copyable {
+    associatedtype Result
+    func callAsFunction<Controller: CongestionControlProtocol>(
+        _ controller: inout Controller,
+        state: inout CongestionControlState
+    ) -> Result
+}
+
+/// Owns the shared congestion control state plus the active algorithm.
+///
+/// Every controller is stored in place so algorithm-specific calls mutate it directly
+/// instead of copying it out of an enum and back. Operations that only touch the shared
+/// state go straight to `state` without dispatching on the algorithm.
 @available(Network 0.1.0, *)
 struct CongestionControl: ~Copyable {
-    enum Algorithm {
-        case cubic(algorithm: Cubic)
+    enum Algorithm: UInt8 {
+        case cubic
         #if !NETWORK_EMBEDDED
-        case ledbat(algorithm: Ledbat)
-        case prague(algorithm: Prague)
+        case ledbat
+        case prague
         #endif
+
+        var name: String {
+            switch self {
+            case .cubic: return "CUBIC"
+            #if !NETWORK_EMBEDDED
+            case .ledbat: return "LEDBAT"
+            case .prague: return "PRAGUE"
+            #endif
+            }
+        }
     }
 
-    var state: CongestionControlState
-    var log: LogPrefixer
-    var algorithm: Algorithm
-
-    init(state: CongestionControlState = CongestionControlState(), log: LogPrefixer, algorithm: Algorithm) {
-        self.state = state
-        self.log = log
-        self.algorithm = algorithm
-    }
-
-    static func createCubic(
-        pacer: inout Pacer,
-        mss: Int,
-        qlog: QLog? = nil,
-        logPrefixer: LogPrefixer
-    ) -> CongestionControl {
-        var state = CongestionControlState()
-        let cubic = Cubic(state: &state, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-        return CongestionControl(state: state, log: logPrefixer, algorithm: .cubic(algorithm: cubic))
-    }
-
+    private(set) var state = CongestionControlState()
+    let log: LogPrefixer
+    private(set) var algorithm: Algorithm
+    private var cubic: Cubic
     #if !NETWORK_EMBEDDED
-    static func createLedbat(mss: Int, qlog: QLog? = nil, logPrefixer: LogPrefixer) -> CongestionControl {
-        var state = CongestionControlState()
-        let ledbat = Ledbat(state: &state, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-        return CongestionControl(state: state, log: logPrefixer, algorithm: .ledbat(algorithm: ledbat))
-    }
-
-    static func createPrague(
-        pacer: inout Pacer,
-        mss: Int,
-        qlog: QLog? = nil,
-        logPrefixer: LogPrefixer
-    ) -> CongestionControl {
-        var state = CongestionControlState()
-        let prague = Prague(state: &state, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: logPrefixer)
-        return CongestionControl(state: state, log: logPrefixer, algorithm: .prague(algorithm: prague))
-    }
+    private var ledbat: Ledbat
+    private var prague: Prague
     #endif
 
-    var congestionWindow: UInt64 {
-        state.congestionWindow
+    init(
+        algorithm: Algorithm,
+        pacer: inout Pacer,
+        mss: Int,
+        qlog: QLog? = nil,
+        logPrefixer: LogPrefixer
+    ) {
+        self.log = logPrefixer
+        self.algorithm = algorithm
+        // Only the active controller is set up; the others hold no state until switched to.
+        self.cubic = Cubic(placeholder: logPrefixer)
+        #if !NETWORK_EMBEDDED
+        self.ledbat = Ledbat(placeholder: logPrefixer)
+        self.prague = Prague(placeholder: logPrefixer)
+        #endif
+        reset(pacer: &pacer, mss: mss, qlog: qlog)
     }
 
-    var availableCongestionWindow: UInt64 {
-        state.availableCongestionWindow
-    }
-
-    var bytesInFlight: UInt64 {
-        state.bytesInFlight
-    }
-
-    var name: String {
+    // Re-creates the active controller and the shared state from scratch.
+    mutating func reset(pacer: inout Pacer, mss: Int, qlog: QLog?) {
+        state = CongestionControlState()
         switch algorithm {
         case .cubic:
-            return "CUBIC"
+            cubic = Cubic(state: &state, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: log)
         #if !NETWORK_EMBEDDED
         case .ledbat:
-            return "LEDBAT"
+            ledbat = Ledbat(state: &state, mss: mss, qlog: qlog, logPrefixer: log)
         case .prague:
-            return "PRAGUE"
+            prague = Prague(state: &state, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: log)
         #endif
         }
     }
+
+    #if !NETWORK_EMBEDDED
+    // Switches to another algorithm, handing it the outgoing shared state.
+    mutating func switchTo(_ newAlgorithm: Algorithm, pacer: inout Pacer, mss: Int, qlog: QLog?) {
+        guard newAlgorithm != algorithm else { return }
+        let oldState = state
+        state = CongestionControlState()
+        switch newAlgorithm {
+        case .cubic:
+            cubic = Cubic(state: &state, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: log)
+            cubic.inherit(from: oldState, state: &state, mss: mss, qlog: qlog)
+        case .ledbat:
+            ledbat = Ledbat(state: &state, mss: mss, qlog: qlog, logPrefixer: log)
+            ledbat.inherit(from: oldState, state: &state, mss: mss, qlog: qlog)
+        case .prague:
+            prague = Prague(state: &state, pacer: &pacer, mss: mss, qlog: qlog, logPrefixer: log)
+            prague.inherit(from: oldState, state: &state, mss: mss, qlog: qlog)
+        }
+        algorithm = newAlgorithm
+    }
+    #endif
+
+    // Dispatches an algorithm-specific operation on the active controller.
+    @inline(always)
+    private mutating func perform<Operation: CongestionControlOperation & ~Copyable>(
+        _ operation: borrowing Operation
+    ) -> Operation.Result {
+        switch algorithm {
+        case .cubic: return operation(&cubic, state: &state)
+        #if !NETWORK_EMBEDDED
+        case .ledbat: return operation(&ledbat, state: &state)
+        case .prague: return operation(&prague, state: &state)
+        #endif
+        }
+    }
+
+    var name: String { algorithm.name }
+
+    // MARK: Shared state; no dispatch.
+
+    var congestionWindow: UInt64 { state.congestionWindow }
+    var availableCongestionWindow: UInt64 { state.availableCongestionWindow }
+    var bytesInFlight: UInt64 { state.bytesInFlight }
 
     func canSend(packetLength: Int) -> Bool {
         state.canSend(packetLength: packetLength, log: log)
@@ -343,22 +387,24 @@ struct CongestionControl: ~Copyable {
         state.mssChanged(mss: mss, log: log, qlog: nil)
     }
 
-    mutating func persistentCongestion(mss: Int, qlog: QLog? = nil) {
+    // MARK: Algorithm-specific; dispatched to the active controller.
+
+    // `inout` arguments can't be stored in an operation, so this one dispatches by hand.
+    func filloutDataTransferSnapshot(dataTransferSnapshot: inout DataTransferSnapshot) {
         switch algorithm {
-        case .cubic(var cubic):
-            cubic.persistentCongestion(state: &state, mss: mss, qlog: qlog)
-            algorithm = .cubic(algorithm: cubic)
+        case .cubic:
+            cubic.filloutDataTransferSnapshot(state: state, dataTransferSnapshot: &dataTransferSnapshot)
         #if !NETWORK_EMBEDDED
-        case .ledbat(var ledbat):
-            ledbat.persistentCongestion(state: &state, mss: mss, qlog: qlog)
-            algorithm = .ledbat(algorithm: ledbat)
-        case .prague(var prague):
-            prague.persistentCongestion(state: &state, mss: mss, qlog: qlog)
-            algorithm = .prague(algorithm: prague)
+        case .ledbat:
+            ledbat.filloutDataTransferSnapshot(state: state, dataTransferSnapshot: &dataTransferSnapshot)
+        case .prague:
+            prague.filloutDataTransferSnapshot(state: state, dataTransferSnapshot: &dataTransferSnapshot)
         #endif
         }
     }
 
+    // `rtt` is borrowed, and an operation can't hold a borrow without `Ref` (Swift 6.4,
+    // OS 27); this one dispatches by hand.
     mutating func ackEnd(
         rtt: borrowing RTT,
         path: QUICPath?,
@@ -368,20 +414,23 @@ struct CongestionControl: ~Copyable {
         qlog: QLog? = nil
     ) {
         switch algorithm {
-        case .cubic(var cubic):
+        case .cubic:
             cubic.ackEnd(state: &state, rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
-            algorithm = .cubic(algorithm: cubic)
         #if !NETWORK_EMBEDDED
-        case .ledbat(var ledbat):
+        case .ledbat:
             ledbat.ackEnd(state: &state, rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
-            algorithm = .ledbat(algorithm: ledbat)
-        case .prague(var prague):
+        case .prague:
             prague.ackEnd(state: &state, rtt: rtt, path: path, mss: mss, packetsLost: packetsLost, now: now, qlog: qlog)
-            algorithm = .prague(algorithm: prague)
         #endif
         }
     }
 
+    @inline(always)
+    mutating func persistentCongestion(mss: Int, qlog: QLog? = nil) {
+        perform(Op.PersistentCongestion(mss: mss, qlog: qlog))
+    }
+
+    @inline(always)
     @discardableResult
     mutating func packetsLost(
         path: QUICPath?,
@@ -391,10 +440,8 @@ struct CongestionControl: ~Copyable {
         smoothedRTT: NetworkDuration,
         now: NetworkClock.Instant
     ) -> Bool {
-        switch algorithm {
-        case .cubic(var cubic):
-            let reducedCongestionWindow = cubic.packetLost(
-                state: &state,
+        perform(
+            Op.PacketsLost(
                 path: path,
                 bytesLost: bytesLost,
                 largestLostSentTime: largestLostSentTime,
@@ -402,37 +449,10 @@ struct CongestionControl: ~Copyable {
                 smoothedRTT: smoothedRTT,
                 now: now
             )
-            algorithm = .cubic(algorithm: cubic)
-            return reducedCongestionWindow
-        #if !NETWORK_EMBEDDED
-        case .ledbat(var ledbat):
-            let reducedCongestionWindow = ledbat.packetLost(
-                state: &state,
-                path: path,
-                bytesLost: bytesLost,
-                largestLostSentTime: largestLostSentTime,
-                mss: mss,
-                smoothedRTT: smoothedRTT,
-                now: now
-            )
-            algorithm = .ledbat(algorithm: ledbat)
-            return reducedCongestionWindow
-        case .prague(var prague):
-            let reducedCongestionWindow = prague.packetLost(
-                state: &state,
-                path: path,
-                bytesLost: bytesLost,
-                largestLostSentTime: largestLostSentTime,
-                mss: mss,
-                smoothedRTT: smoothedRTT,
-                now: now
-            )
-            algorithm = .prague(algorithm: prague)
-            return reducedCongestionWindow
-        #endif
-        }
+        )
     }
 
+    @inline(always)
     mutating func processECN(
         path: QUICPath?,
         ceCount: Int,
@@ -445,10 +465,8 @@ struct CongestionControl: ~Copyable {
         now: NetworkClock.Instant,
         qlog: QLog? = nil
     ) {
-        switch algorithm {
-        case .cubic(var cubic):
-            cubic.processECN(
-                state: &state,
+        perform(
+            Op.ProcessECN(
                 path: path,
                 ceCount: ceCount,
                 packetsAcked: packetsAcked,
@@ -460,84 +478,114 @@ struct CongestionControl: ~Copyable {
                 now: now,
                 qlog: qlog
             )
-            algorithm = .cubic(algorithm: cubic)
-        #if !NETWORK_EMBEDDED
-        case .ledbat(var ledbat):
-            ledbat.processECN(
-                state: &state,
-                path: path,
-                ceCount: ceCount,
-                packetsAcked: packetsAcked,
-                largestSentPN: largestSentPN,
-                largestAckedPN: largestAckedPN,
-                largestAckedSentTime: largestAckedSentTime,
-                mss: mss,
-                smoothedRTT: smoothedRTT,
-                now: now,
-                qlog: qlog
-            )
-            algorithm = .ledbat(algorithm: ledbat)
-        case .prague(var prague):
-            prague.processECN(
-                state: &state,
-                path: path,
-                ceCount: ceCount,
-                packetsAcked: packetsAcked,
-                largestSentPN: largestSentPN,
-                largestAckedPN: largestAckedPN,
-                largestAckedSentTime: largestAckedSentTime,
-                mss: mss,
-                smoothedRTT: smoothedRTT,
-                now: now,
-                qlog: qlog
-            )
-            algorithm = .prague(algorithm: prague)
-        #endif
-        }
+        )
     }
 
+    @inline(always)
     mutating func spuriousRetransmit(qlog: QLog? = nil) {
-        switch algorithm {
-        case .cubic(var cubic):
-            cubic.spuriousRetransmit(state: &state, qlog: qlog)
-            algorithm = .cubic(algorithm: cubic)
-        #if !NETWORK_EMBEDDED
-        case .ledbat(var ledbat):
-            ledbat.spuriousRetransmit(state: &state, qlog: qlog)
-            algorithm = .ledbat(algorithm: ledbat)
-        case .prague(var prague):
-            prague.spuriousRetransmit(state: &state, qlog: qlog)
-            algorithm = .prague(algorithm: prague)
-        #endif
-        }
+        perform(Op.SpuriousRetransmit(qlog: qlog))
     }
 
+    @inline(always)
     mutating func idleTimeout(mss: Int) {
-        switch algorithm {
-        case .cubic(var cubic):
-            cubic.idleTimeout(state: &state, mss: mss, qlog: nil)
-            algorithm = .cubic(algorithm: cubic)
-        #if !NETWORK_EMBEDDED
-        case .ledbat(var ledbat):
-            ledbat.idleTimeout(state: &state, mss: mss, qlog: nil)
-            algorithm = .ledbat(algorithm: ledbat)
-        case .prague(var prague):
-            prague.idleTimeout(state: &state, mss: mss, qlog: nil)
-            algorithm = .prague(algorithm: prague)
-        #endif
-        }
+        perform(Op.IdleTimeout(mss: mss))
     }
+}
 
-    func filloutDataTransferSnapshot(dataTransferSnapshot: inout DataTransferSnapshot) {
-        switch algorithm {
-        case .cubic(let cubic):
-            cubic.filloutDataTransferSnapshot(state: state, dataTransferSnapshot: &dataTransferSnapshot)
-        #if !NETWORK_EMBEDDED
-        case .ledbat(let ledbat):
-            ledbat.filloutDataTransferSnapshot(state: state, dataTransferSnapshot: &dataTransferSnapshot)
-        case .prague(let prague):
-            prague.filloutDataTransferSnapshot(state: state, dataTransferSnapshot: &dataTransferSnapshot)
-        #endif
+// MARK: - Operations
+
+@available(Network 0.1.0, *)
+extension CongestionControl {
+    fileprivate enum Op {
+        struct PersistentCongestion: CongestionControlOperation, ~Copyable {
+            let mss: Int
+            let qlog: QLog?
+
+            func callAsFunction<Controller: CongestionControlProtocol>(
+                _ controller: inout Controller,
+                state: inout CongestionControlState
+            ) {
+                controller.persistentCongestion(state: &state, mss: mss, qlog: qlog)
+            }
+        }
+
+        struct PacketsLost: CongestionControlOperation, ~Copyable {
+            let path: QUICPath?
+            let bytesLost: Int
+            let largestLostSentTime: NetworkClock.Instant
+            let mss: Int
+            let smoothedRTT: NetworkDuration
+            let now: NetworkClock.Instant
+
+            func callAsFunction<Controller: CongestionControlProtocol>(
+                _ controller: inout Controller,
+                state: inout CongestionControlState
+            ) -> Bool {
+                controller.packetLost(
+                    state: &state,
+                    path: path,
+                    bytesLost: bytesLost,
+                    largestLostSentTime: largestLostSentTime,
+                    mss: mss,
+                    smoothedRTT: smoothedRTT,
+                    now: now,
+                    qlog: nil
+                )
+            }
+        }
+
+        struct ProcessECN: CongestionControlOperation, ~Copyable {
+            let path: QUICPath?
+            let ceCount: Int
+            let packetsAcked: Int
+            let largestSentPN: Int64
+            let largestAckedPN: Int64
+            let largestAckedSentTime: NetworkClock.Instant
+            let mss: Int
+            let smoothedRTT: NetworkDuration
+            let now: NetworkClock.Instant
+            let qlog: QLog?
+
+            func callAsFunction<Controller: CongestionControlProtocol>(
+                _ controller: inout Controller,
+                state: inout CongestionControlState
+            ) {
+                controller.processECN(
+                    state: &state,
+                    path: path,
+                    ceCount: ceCount,
+                    packetsAcked: packetsAcked,
+                    largestSentPN: largestSentPN,
+                    largestAckedPN: largestAckedPN,
+                    largestAckedSentTime: largestAckedSentTime,
+                    mss: mss,
+                    smoothedRTT: smoothedRTT,
+                    now: now,
+                    qlog: qlog
+                )
+            }
+        }
+
+        struct SpuriousRetransmit: CongestionControlOperation, ~Copyable {
+            let qlog: QLog?
+
+            func callAsFunction<Controller: CongestionControlProtocol>(
+                _ controller: inout Controller,
+                state: inout CongestionControlState
+            ) {
+                controller.spuriousRetransmit(state: &state, qlog: qlog)
+            }
+        }
+
+        struct IdleTimeout: CongestionControlOperation, ~Copyable {
+            let mss: Int
+
+            func callAsFunction<Controller: CongestionControlProtocol>(
+                _ controller: inout Controller,
+                state: inout CongestionControlState
+            ) {
+                controller.idleTimeout(state: &state, mss: mss, qlog: nil)
+            }
         }
     }
 }

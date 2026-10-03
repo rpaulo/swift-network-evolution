@@ -107,6 +107,11 @@ struct Prague: CongestionControlProtocol, CubicLikeProtocol {
         UInt64(min(10 * mss, max(2 * mss, 14720)))
     }
 
+    // An inactive controller, holding no state until it is switched to.
+    init(placeholder logPrefixer: LogPrefixer) {
+        self.log = logPrefixer
+    }
+
     init(state: inout CongestionControlState, pacer: inout Pacer, mss: Int, qlog: QLog? = nil, logPrefixer: LogPrefixer)
     {
         self.log = logPrefixer

@@ -339,7 +339,8 @@ public final class QUICPath: MultiplexingDatagramPath<
         self.pacer = Pacer()
         // Overwritten with the real mss/qlog once `setup()` runs; RX/TX aren't allowed on a
         // path until then, so this placeholder is never observed.
-        self.congestionControl = CongestionControl.createCubic(
+        self.congestionControl = CongestionControl(
+            algorithm: .cubic,
             pacer: &self.pacer,
             mss: 0,
             qlog: nil,
@@ -379,7 +380,8 @@ public final class QUICPath: MultiplexingDatagramPath<
 
         let pacerEnabled = (pacePackets || QUICPreferences.shared.pacePackets)
         self.pacer = Pacer(enabled: pacerEnabled)
-        self.congestionControl = .createCubic(
+        self.congestionControl = CongestionControl(
+            algorithm: .cubic,
             pacer: &self.pacer,
             mss: self.initialMSS,
             qlog: parentProtocol.qLog,
@@ -428,30 +430,7 @@ public final class QUICPath: MultiplexingDatagramPath<
     }
 
     func resetCongestionControl() {
-        switch self.congestionControl.algorithm {
-        case .cubic:
-            self.congestionControl = .createCubic(
-                pacer: &self.pacer,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog,
-                logPrefixer: self.log
-            )
-        #if !NETWORK_EMBEDDED
-        case .ledbat:
-            self.congestionControl = .createLedbat(
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog,
-                logPrefixer: self.log
-            )
-        case .prague:
-            self.congestionControl = .createPrague(
-                pacer: &self.pacer,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog,
-                logPrefixer: self.log
-            )
-        #endif
-        }
+        congestionControl.reset(pacer: &pacer, mss: initialMSS, qlog: parentProtocol.qLog)
     }
 
     func idleTimeoutCongestionControl() {
@@ -476,73 +455,16 @@ public final class QUICPath: MultiplexingDatagramPath<
     func markAsBackground(_ background: Bool) {
         #if !NETWORK_EMBEDDED
         // Use LEDBAT for background cases
-        switch self.congestionControl.algorithm {
-        case .cubic:
-            if !background { return }  // Nothing to do, already not background
-            let oldState = self.congestionControl.state
-            var newState = CongestionControlState()
-            var ledbat = Ledbat(
-                state: &newState,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog,
-                logPrefixer: self.log
-            )
-            ledbat.inherit(
-                from: oldState,
-                state: &newState,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog
-            )
-            self.congestionControl = CongestionControl(
-                state: newState,
-                log: self.log,
-                algorithm: .ledbat(algorithm: ledbat)
-            )
-        case .ledbat:
-            if background { return }  // Nothing to do, already background
-            // Inherit from the current LEDBAT so bytes in flight (and the window) carry over.
-            let oldState = self.congestionControl.state
-            var newState = CongestionControlState()
-            var cubic = Cubic(
-                state: &newState,
-                pacer: &self.pacer,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog,
-                logPrefixer: self.log
-            )
-            cubic.inherit(
-                from: oldState,
-                state: &newState,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog
-            )
-            self.congestionControl = CongestionControl(
-                state: newState,
-                log: self.log,
-                algorithm: .cubic(algorithm: cubic)
-            )
-        case .prague:
-            if !background { return }  // Nothing to do, already not background
-            let oldState = self.congestionControl.state
-            var newState = CongestionControlState()
-            var ledbat = Ledbat(
-                state: &newState,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog,
-                logPrefixer: self.log
-            )
-            ledbat.inherit(
-                from: oldState,
-                state: &newState,
-                mss: self.initialMSS,
-                qlog: parentProtocol.qLog
-            )
-            self.congestionControl = CongestionControl(
-                state: newState,
-                log: self.log,
-                algorithm: .ledbat(algorithm: ledbat)
-            )
+        let target: CongestionControl.Algorithm
+        if background {
+            target = .ledbat
+        } else if congestionControl.algorithm == .ledbat {
+            target = .cubic
+        } else {
+            return  // Nothing to do, already not background
         }
+        // The new controller inherits bytes in flight (and, by its own rule, the window).
+        congestionControl.switchTo(target, pacer: &pacer, mss: initialMSS, qlog: parentProtocol.qLog)
         #endif
     }
 

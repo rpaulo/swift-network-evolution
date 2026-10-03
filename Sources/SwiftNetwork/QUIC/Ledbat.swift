@@ -42,6 +42,11 @@ struct Ledbat: CongestionControlProtocol, CubicLikeProtocol {
         UInt64(min(2 * mss, Ledbat.defaultCongestionWindow))
     }
 
+    // An inactive controller, holding no state until it is switched to.
+    init(placeholder logPrefixer: LogPrefixer) {
+        self.log = logPrefixer
+    }
+
     init(state: inout CongestionControlState, mss: Int, qlog: QLog? = nil, logPrefixer: LogPrefixer) {
         self.log = logPrefixer
         state.congestionWindow = Ledbat.initialCongestionWindow(mss)
