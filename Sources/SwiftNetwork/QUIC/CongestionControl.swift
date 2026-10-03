@@ -24,6 +24,11 @@ internal import Logging
 internal import os
 #endif
 
+// Congestion window validation samples (RFC 7661 pipeACK), stored inline to avoid a heap
+// allocation per controller.
+@available(Network 0.1.0, *)
+typealias PipeAckSamples = [3 of UInt64]
+
 /// The state share by all algorithms Cubic, Ledbats, and Prague
 ///
 /// This is the single, authoritative copy of this state that is used throughout each algorithm
@@ -39,14 +44,14 @@ struct CongestionControlState {
     var prevSlowStartThreshold = UInt64.max
     var recoveryStartTime = NetworkClock.Instant.zero
     var bytesAcked = UInt64(0)
-    var pipeAckSamples = [UInt64(0)]
+    var pipeAckSamples = PipeAckSamples(repeating: 0)
     var pipeAckValue = UInt64(0)
     var pipeAckSampleEnd = NetworkClock.Instant.zero
     var pipeAckAcked = UInt64(0)
     var pipeAckIndex = 0
 
     var congestionWindowValidationSamples: Int {
-        3
+        PipeAckSamples.count
     }
 
     var availableCongestionWindow: UInt64 {
@@ -156,7 +161,7 @@ struct CongestionControlState {
     }
 
     mutating func initPipeAckSamples() {
-        pipeAckSamples = Array(repeating: 0, count: congestionWindowValidationSamples)
+        pipeAckSamples = PipeAckSamples(repeating: 0)
         pipeAckIndex = 0
         pipeAckValue = 0
     }
