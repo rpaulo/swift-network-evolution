@@ -370,29 +370,52 @@ struct Recovery: ~Copyable, PrefixedLoggable, NonCopyableTimerUser {
             }
         }
 
+        /// What a batch of losses amounts to on one of the paths its packets were sent on.
+        private struct PathLoss {
+            var pathID: MultiplexingPathIdentifier
+            var bytesLost: Int
+            // The largest packet lost on this path, and when it was sent.
+            var largestLostPacketNumber: PacketNumber
+            var largestLostSentTime: NetworkClock.Instant
+        }
+
         mutating func declarePacketLost(
             _ lostPackets: [PacketIdentifier],
             connection: QUICConnection
         ) {
+            // A batch can span paths, for example after a migration, when the packets still
+            // outstanding on the old path are declared lost. Each path's congestion controller
+            // must only see its own losses.
+            var pathLosses: [PathLoss] = []
+            var largestLostPathID: MultiplexingPathIdentifier = .none
+
             // We assume that the packets are in packet-number order. Verify that
             // the sent time of each packet is after that of the earlier packet.
-            var totalLength: Int = 0
-            let lostPacketCount = lostPackets.count
-            for lostPacketIndex in 0..<lostPacketCount {
-                let isLastPacket = (lostPacketIndex == (lostPacketCount - 1))
-                let lostPacketIdentifier = lostPackets[lostPacketIndex]
-                var reducedCongestionWindow = false
+            for lostPacketIdentifier in lostPackets {
                 var smallestLostSentTime = self.smallestLostSentTime
                 var largestLostSentTime = self.largestLostSentTime
                 var largestLostPacketNumber = self.largestLostPacketNumber
-                var pathID: MultiplexingPathIdentifier = .none
 
                 findSentPacketEntry(packetNumber: lostPacketIdentifier.number) { entry in
-                    if entry.packet.isInFlightEligible {
-                        totalLength += entry.packet.totalLength
+                    let pathID = entry.packet.sentPath
+                    let bytesLost = entry.packet.isInFlightEligible ? entry.packet.totalLength : 0
+                    if let index = pathLosses.firstIndex(where: { $0.pathID == pathID }) {
+                        pathLosses[index].bytesLost += bytesLost
+                        pathLosses[index].largestLostPacketNumber = entry.packet.number
+                        pathLosses[index].largestLostSentTime = entry.sentTime
+                    } else {
+                        pathLosses.append(
+                            PathLoss(
+                                pathID: pathID,
+                                bytesLost: bytesLost,
+                                largestLostPacketNumber: entry.packet.number,
+                                largestLostSentTime: entry.sentTime
+                            )
+                        )
                     }
+                    largestLostPathID = pathID
 
-                    if entry.packet.isECNValidationPacket, let path = connection.path(for: entry.packet.sentPath) {
+                    if entry.packet.isECNValidationPacket, let path = connection.path(for: pathID) {
                         path.ecnState?.validationPacketLost()
                     }
 
@@ -420,33 +443,32 @@ struct Recovery: ~Copyable, PrefixedLoggable, NonCopyableTimerUser {
                         trigger: .reordering,
                         connection: connection
                     )
-
-                    if isLastPacket {
-                        // `self.largestLostSentTime` still holds the previous batch's value
-                        // here; it is only updated once this closure returns.
-                        reducedCongestionWindow = notifyLossToPath(
-                            packetNumber: entry.packet.number,
-                            pathID: entry.packet.sentPath,
-                            bytesLost: totalLength,
-                            largestLostSentTime: largestLostSentTime,
-                            connection: connection
-                        )
-                        pathID = entry.packet.sentPath
-                    }
                 }
 
                 self.smallestLostSentTime = smallestLostSentTime
                 self.largestLostSentTime = largestLostSentTime
                 self.largestLostPacketNumber = largestLostPacketNumber
+            }
 
-                if reducedCongestionWindow, let lastPacketIdentifier = lostPackets.last {
-                    modifySentPacketEntry(packetNumber: lastPacketIdentifier.number) { entry in
+            for pathLoss in pathLosses {
+                let reducedCongestionWindow = notifyLossToPath(
+                    packetNumber: pathLoss.largestLostPacketNumber,
+                    pathID: pathLoss.pathID,
+                    bytesLost: pathLoss.bytesLost,
+                    largestLostSentTime: pathLoss.largestLostSentTime,
+                    connection: connection
+                )
+                // A late ACK for this packet undoes the reduction on its path.
+                if reducedCongestionWindow {
+                    modifySentPacketEntry(packetNumber: pathLoss.largestLostPacketNumber) { entry in
                         entry.reducedCongestionWindow = true
                     }
                 }
-
-                updateCongestionOnPath(pathID, connection: connection)
             }
+
+            // Persistent congestion is still tracked per packet number space, across paths, so it
+            // is only evaluated on the path of the largest lost packet.
+            updateCongestionOnPath(largestLostPathID, connection: connection)
         }
 
         mutating func packetAcked(

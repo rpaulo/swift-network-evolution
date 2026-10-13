@@ -477,6 +477,23 @@ final class RecoveryTests: XCTestCase {
         connection.recovery.withImmutableInnerState(packetNumberSpace: .applicationData) { $0.lostPacketCount }
     }
 
+    /// Registers a second path on the connection, alongside `path`.
+    private func addPath() -> QUICPath {
+        let newPath = connection.context.onQueue {
+            QUICPath.makeFromExternalTest(parent: connection)
+        }
+        newPath.set(interface: nil, priority: 1, isInitial: true)
+        connection.multiplexingPaths[newPath.pathIdentifier] = newPath
+        XCTAssertNotEqual(newPath.pathIdentifier, path.pathIdentifier)
+        return newPath
+    }
+
+    /// Unregisters and destroys a path made by `addPath`, as tearing down a migrated path does.
+    private func removePath(_ oldPath: QUICPath) {
+        connection.multiplexingPaths.removeValue(forKey: oldPath.pathIdentifier)
+        connection.context.onQueue { oldPath.destroyFromExternalTest() }
+    }
+
     // RFC 9002 Section 7.3.2: a loss of a packet sent after recovery started is a new congestion
     // event. Congestion control must be given the sent time of the packets lost in this round,
     // not of an earlier one; on a fresh connection that earlier time is zero and looks like it
@@ -570,16 +587,8 @@ final class RecoveryTests: XCTestCase {
 
         // A second path that the spuriously lost packet goes out on. `path` (from setUp)
         // receives every ACK.
-        let sentPath = connection.context.onQueue {
-            QUICPath.makeFromExternalTest(parent: connection)
-        }
-        sentPath.set(interface: nil, priority: 1, isInitial: true)
-        connection.multiplexingPaths[sentPath.pathIdentifier] = sentPath
-        defer {
-            connection.multiplexingPaths[sentPath.pathIdentifier] = nil
-            connection.context.onQueue { sentPath.destroyFromExternalTest() }
-        }
-        XCTAssertNotEqual(sentPath.pathIdentifier, path.pathIdentifier)
+        let sentPath = addPath()
+        defer { removePath(sentPath) }
         let ackPathInitialWindow = path.congestionControlWindow
         let sentPathInitialWindow = sentPath.congestionControlWindow
 
@@ -608,6 +617,60 @@ final class RecoveryTests: XCTestCase {
         XCTAssertEqual(path.congestionControlWindow, ackPathWindow)
         XCTAssertEqual(slowStartThreshold(of: path), ackPathSlowStartThreshold)
         XCTAssertNil(outstandingEntry(5))
+    }
+
+    /// When one batch of losses spans paths, each path's congestion controller sees only the
+    /// bytes lost on it, and each path's reduction can be undone by a spurious loss on it.
+    func testLossesInOneBatchAreChargedToTheirOwnPaths() {
+        let start = NetworkClock.Instant.testBase
+        defer { connection.pinnedClock = nil }
+        let otherPath = addPath()
+        defer { removePath(otherPath) }
+        let initialWindow = otherPath.congestionControlWindow
+
+        // Packets 0 and 2 go out on `path` and packet 1 on the other path. All three are
+        // overtaken by three packets and are declared lost together.
+        sendPackets(0...0, on: path, at: start)
+        sendPackets(1...1, on: otherPath, at: start)
+        sendPackets(2...5, on: path, at: start)
+        XCTAssertEqual(path.congestionControlBytesInFlight, 5000)
+        XCTAssertEqual(otherPath.congestionControlBytesInFlight, 1000)
+        receiveAck(3...5, on: path, at: start + .milliseconds(10))
+        XCTAssertEqual(lostPacketCount, 3)
+
+        // `path` lost 2000 bytes and the other path 1000; both have nothing left in flight.
+        XCTAssertEqual(path.congestionControlBytesInFlight, 0)
+        XCTAssertEqual(otherPath.congestionControlBytesInFlight, 0)
+        XCTAssertLessThan(path.congestionControlWindow, initialWindow)
+        XCTAssertLessThan(otherPath.congestionControlWindow, initialWindow)
+        // Each path's largest lost packet records its path's reduction.
+        XCTAssertEqual(outstandingEntry(0)?.reducedCongestionWindow, false)
+        XCTAssertEqual(outstandingEntry(1)?.reducedCongestionWindow, true)
+        XCTAssertEqual(outstandingEntry(2)?.reducedCongestionWindow, true)
+    }
+
+    /// Packets still outstanding on a path that has gone away, as after a migration, are
+    /// declared lost alongside real losses on the remaining path. The remaining path must still
+    /// account for its own losses.
+    func testLossOnRemovedPathDoesNotHideLossOnRemainingPath() {
+        let start = NetworkClock.Instant.testBase
+        defer { connection.pinnedClock = nil }
+        let initialWindow = path.congestionControlWindow
+        let oldPath = addPath()
+
+        // Packet 1, the largest of the batch lost below, goes out on the path that goes away.
+        sendPackets(0...0, on: path, at: start)
+        sendPackets(1...1, on: oldPath, at: start)
+        sendPackets(2...4, on: path, at: start)
+        removePath(oldPath)
+
+        // Packet 0 is overtaken by three packets; packet 1 is lost with its path.
+        receiveAck(2...4, on: path, at: start + .milliseconds(10))
+        XCTAssertEqual(lostPacketCount, 2)
+
+        XCTAssertEqual(path.congestionControlBytesInFlight, 0)
+        XCTAssertLessThan(path.congestionControlWindow, initialWindow)
+        XCTAssertEqual(outstandingEntry(0)?.reducedCongestionWindow, true)
     }
 
     func testPacketAckedNonAckEliciting() throws {
